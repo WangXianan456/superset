@@ -16,7 +16,6 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-import React from 'react';
 import { views } from 'src/core';
 import { ViewLocations } from 'src/SqlLab/contributions';
 import AiSqlAssistant from 'src/SqlLab/components/AiSqlAssistant';
@@ -34,4 +33,3 @@ if (ENABLE_AI_SQL_ASSISTANT_PLACEHOLDER) {
     () => <AiSqlAssistant />,
   );
 }
-

@@ -39,6 +39,7 @@ import TabbedSqlEditors from '../TabbedSqlEditors';
 import QueryAutoRefresh from '../QueryAutoRefresh';
 import PopEditorTab from '../PopEditorTab';
 import AppLayout from '../AppLayout';
+import 'src/SqlLab/registerAiSqlAssistant';
 
 const SqlLabStyles = styled.div`
   ${({ theme }) => css`

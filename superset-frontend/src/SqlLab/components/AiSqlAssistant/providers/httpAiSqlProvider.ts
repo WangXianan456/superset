@@ -16,11 +16,32 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-import type { AiSqlProvider } from '../types';
+import { t } from '@apache-superset/core/translation';
+import { getClientErrorObject, SupersetClient } from '@superset-ui/core';
+import type { AiSqlAssistantResult, AiSqlProvider } from '../types';
 
 export const httpAiSqlProvider: AiSqlProvider = {
-  async generateSql() {
-    throw new Error('httpAiSqlProvider is not wired yet.');
+  async generateSql({ question, context }) {
+    try {
+      const { json } = await SupersetClient.post({
+        endpoint: '/api/v1/ai_sql/generate',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          question,
+          database_id: context.databaseId,
+          schema: context.schema,
+          current_sql: context.currentSql,
+        }),
+      });
+
+      return json.result as AiSqlAssistantResult;
+    } catch (error) {
+      const parsedError = await getClientErrorObject(error);
+      throw new Error(
+        parsedError.message ||
+          parsedError.error ||
+          t('Failed to generate SQL.'),
+      );
+    }
   },
 };
-

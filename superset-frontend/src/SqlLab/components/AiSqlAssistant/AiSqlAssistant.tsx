@@ -26,7 +26,7 @@ import copyTextToClipboard from 'src/utils/copy';
 import { useToasts } from 'src/components/MessageToasts/withToasts';
 import AiSqlAssistantPanel from './AiSqlAssistantPanel';
 import { useAiSqlAssistant } from './hooks/useAiSqlAssistant';
-import { mockAiSqlProvider } from './providers/mockAiSqlProvider';
+import { httpAiSqlProvider } from './providers/httpAiSqlProvider';
 import type { AiSqlAssistantContext, AiSqlProvider } from './types';
 
 export type AiSqlAssistantProps = {
@@ -34,7 +34,7 @@ export type AiSqlAssistantProps = {
 };
 
 const AiSqlAssistant = ({
-  provider = mockAiSqlProvider,
+  provider = httpAiSqlProvider,
 }: AiSqlAssistantProps) => {
   const dispatch = useAppDispatch();
   const { addDangerToast, addSuccessToast } = useToasts();

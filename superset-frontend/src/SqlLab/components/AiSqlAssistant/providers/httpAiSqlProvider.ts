@@ -18,10 +18,14 @@
  */
 import { t } from '@apache-superset/core/translation';
 import { getClientErrorObject, SupersetClient } from '@superset-ui/core';
-import type { AiSqlAssistantResult, AiSqlProvider } from '../types';
+import type {
+  AiSqlAssistantResult,
+  AiSqlProvider,
+  SuggestTablesResult,
+} from '../types';
 
 export const httpAiSqlProvider: AiSqlProvider = {
-  async generateSql({ question, context }) {
+  async generateSql({ question, context, tables }) {
     try {
       const { json } = await SupersetClient.post({
         endpoint: '/api/v1/ai_sql/generate',
@@ -29,7 +33,9 @@ export const httpAiSqlProvider: AiSqlProvider = {
         body: JSON.stringify({
           question,
           database_id: context.databaseId,
+          catalog: context.catalog,
           schema: context.schema,
+          tables,
           current_sql: context.currentSql,
         }),
       });
@@ -41,6 +47,31 @@ export const httpAiSqlProvider: AiSqlProvider = {
         parsedError.message ||
           parsedError.error ||
           t('Failed to generate SQL.'),
+      );
+    }
+  },
+
+  async suggestTables({ question, context, limit = 10 }) {
+    try {
+      const { json } = await SupersetClient.post({
+        endpoint: '/api/v1/ai_sql/suggest_tables',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          question,
+          database_id: context.databaseId,
+          catalog: context.catalog,
+          schema: context.schema,
+          limit,
+        }),
+      });
+
+      return json.result as SuggestTablesResult;
+    } catch (error) {
+      const parsedError = await getClientErrorObject(error);
+      throw new Error(
+        parsedError.message ||
+          parsedError.error ||
+          t('Failed to suggest tables.'),
       );
     }
   },

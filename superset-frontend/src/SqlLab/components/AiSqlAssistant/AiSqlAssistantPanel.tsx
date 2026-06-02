@@ -24,6 +24,7 @@ import { Button, Input } from '@superset-ui/core/components';
 import type {
   AiSqlAssistantContext,
   AiSqlAssistantResult,
+  AiSqlSuggestedTable,
 } from './types';
 
 const Panel = styled.div`
@@ -71,6 +72,42 @@ const Actions = styled.div`
   `}
 `;
 
+const TableList = styled.div`
+  ${({ theme }) => css`
+    display: flex;
+    flex-direction: column;
+    gap: ${theme.sizeUnit}px;
+    max-height: 180px;
+    overflow: auto;
+    padding: ${theme.sizeUnit * 2}px;
+    border: 1px solid ${theme.colorBorderSecondary};
+    border-radius: ${theme.borderRadius}px;
+    background: ${theme.colorBgContainer};
+  `}
+`;
+
+const TableOption = styled.label`
+  ${({ theme }) => css`
+    display: flex;
+    align-items: flex-start;
+    gap: ${theme.sizeUnit * 2}px;
+    font-size: ${theme.fontSizeSM}px;
+    cursor: pointer;
+
+    input {
+      flex: 0 0 auto;
+      margin-top: 2px;
+    }
+  `}
+`;
+
+const TableOptionMeta = styled.span`
+  ${({ theme }) => css`
+    color: ${theme.colorTextSecondary};
+    margin-left: ${theme.sizeUnit}px;
+  `}
+`;
+
 const SqlBlock = styled.pre`
   ${({ theme }) => css`
     flex: 0 0 auto;
@@ -99,9 +136,14 @@ export type AiSqlAssistantPanelProps = {
   context: AiSqlAssistantContext;
   question: string;
   loading: boolean;
+  suggestingTables: boolean;
   error: string | null;
   result: AiSqlAssistantResult | null;
+  suggestedTables: AiSqlSuggestedTable[];
+  selectedTables: string[];
   onQuestionChange: (question: string) => void;
+  onSuggestTables: () => void;
+  onToggleTable: (tableName: string) => void;
   onGenerate: () => void;
   onCopy: () => void;
   onInsert: () => void;
@@ -117,9 +159,14 @@ const AiSqlAssistantPanel = ({
   context,
   question,
   loading,
+  suggestingTables,
   error,
   result,
+  suggestedTables,
+  selectedTables,
   onQuestionChange,
+  onSuggestTables,
+  onToggleTable,
   onGenerate,
   onCopy,
   onInsert,
@@ -139,14 +186,50 @@ const AiSqlAssistantPanel = ({
       }
     />
 
-    <Button
-      buttonStyle="primary"
-      disabled={loading}
-      onClick={onGenerate}
-      block
-    >
-      {loading ? t('Generating...') : t('Generate SQL')}
-    </Button>
+    <Actions>
+      <Button
+        disabled={loading || suggestingTables}
+        onClick={onSuggestTables}
+        block
+      >
+        {suggestingTables ? t('Finding tables...') : t('Suggest tables')}
+      </Button>
+      <Button
+        buttonStyle="primary"
+        disabled={loading || suggestingTables}
+        onClick={onGenerate}
+        block
+      >
+        {loading ? t('Generating...') : t('Generate SQL')}
+      </Button>
+    </Actions>
+
+    {suggestedTables.length > 0 && (
+      <ResultSection>
+        <ContextText>
+          {t('Suggested tables')}: {selectedTables.length}/
+          {suggestedTables.length}
+        </ContextText>
+        <TableList>
+          {suggestedTables.map(table => (
+            <TableOption key={table.name}>
+              <input
+                type="checkbox"
+                checked={selectedTables.includes(table.name)}
+                onChange={() => onToggleTable(table.name)}
+              />
+              <span>
+                {table.name}
+                <TableOptionMeta>
+                  {table.type ? `${table.type} / ` : ''}
+                  {t('score')}: {table.score}
+                </TableOptionMeta>
+              </span>
+            </TableOption>
+          ))}
+        </TableList>
+      </ResultSection>
+    )}
 
     {error && <Alert type="error" message={error} closable={false} />}
 

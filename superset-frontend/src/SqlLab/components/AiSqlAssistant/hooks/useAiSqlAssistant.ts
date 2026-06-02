@@ -20,6 +20,7 @@ import { useCallback, useState } from 'react';
 import type {
   AiSqlAssistantContext,
   AiSqlAssistantResult,
+  AiSqlSuggestedTable,
   AiSqlProvider,
 } from '../types';
 
@@ -29,8 +30,50 @@ export const useAiSqlAssistant = (
 ) => {
   const [question, setQuestion] = useState('');
   const [loading, setLoading] = useState(false);
+  const [suggestingTables, setSuggestingTables] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [result, setResult] = useState<AiSqlAssistantResult | null>(null);
+  const [suggestedTables, setSuggestedTables] = useState<AiSqlSuggestedTable[]>(
+    [],
+  );
+  const [selectedTables, setSelectedTables] = useState<string[]>([]);
+
+  const suggestTables = useCallback(async () => {
+    const trimmedQuestion = question.trim();
+    if (!trimmedQuestion) {
+      setError('Enter a question first.');
+      return;
+    }
+
+    if (!context.databaseId) {
+      setError('Select a database first.');
+      return;
+    }
+
+    setSuggestingTables(true);
+    setError(null);
+
+    try {
+      const response = await provider.suggestTables({
+        question: trimmedQuestion,
+        context,
+      });
+      setSuggestedTables(response.tables);
+      setSelectedTables(response.tables.map(table => table.name));
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to suggest tables.');
+    } finally {
+      setSuggestingTables(false);
+    }
+  }, [context, provider, question]);
+
+  const toggleSelectedTable = useCallback((tableName: string) => {
+    setSelectedTables(currentTables =>
+      currentTables.includes(tableName)
+        ? currentTables.filter(name => name !== tableName)
+        : [...currentTables, tableName],
+    );
+  }, []);
 
   const generateSql = useCallback(async () => {
     const trimmedQuestion = question.trim();
@@ -46,6 +89,7 @@ export const useAiSqlAssistant = (
       const response = await provider.generateSql({
         question: trimmedQuestion,
         context,
+        tables: selectedTables,
       });
       setResult(response);
     } catch (err) {
@@ -53,15 +97,19 @@ export const useAiSqlAssistant = (
     } finally {
       setLoading(false);
     }
-  }, [context, provider, question]);
+  }, [context, provider, question, selectedTables]);
 
   return {
     question,
     setQuestion,
     loading,
+    suggestingTables,
     error,
     result,
+    suggestedTables,
+    selectedTables,
+    suggestTables,
+    toggleSelectedTable,
     generateSql,
   };
 };
-

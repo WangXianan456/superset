@@ -19,6 +19,7 @@
 export type AiSqlAssistantContext = {
   databaseId?: number;
   databaseName?: string;
+  catalog?: string | null;
   schema?: string;
   currentSql?: string;
 };
@@ -33,11 +34,34 @@ export type AiSqlAssistantResult = {
 export type GenerateSqlRequest = {
   question: string;
   context: AiSqlAssistantContext;
+  tables: string[];
+};
+
+export type AiSqlSuggestedTable = {
+  name: string;
+  type?: string;
+  score: number;
+  reason?: string;
+};
+
+export type SuggestTablesRequest = {
+  question: string;
+  context: AiSqlAssistantContext;
+  limit?: number;
+};
+
+export type SuggestTablesResult = {
+  tables: AiSqlSuggestedTable[];
+  scanned_table_count?: number;
+  total_table_count?: number;
+  warnings?: string[];
 };
 
 export type AiSqlProvider = {
   generateSql: (
     request: GenerateSqlRequest,
   ) => Promise<AiSqlAssistantResult>;
+  suggestTables: (
+    request: SuggestTablesRequest,
+  ) => Promise<SuggestTablesResult>;
 };
-

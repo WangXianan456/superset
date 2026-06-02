@@ -19,13 +19,11 @@ from sqlglot import exp, generator, parser
 from sqlglot.dialects.dialect import Dialect, rename_func
 
 
-class DremioRegexpSplit(exp.Expression, exp.Func):
+class DremioRegexpSplit(exp.Func):
     """
     Custom REGEXP_SPLIT function for Dremio that supports 4 arguments.
 
-    In sqlglot 30 the Expression class was split from the Func base class; custom
-    Func subclasses must now explicitly inherit from both exp.Expression and exp.Func
-    so that exp.Expression._set_parent is reachable via the MRO.
+    exp.Func already inherits from exp.Expression in supported sqlglot versions.
     """
 
     arg_types = {

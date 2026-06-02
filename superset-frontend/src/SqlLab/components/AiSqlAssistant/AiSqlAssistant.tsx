@@ -66,18 +66,30 @@ const AiSqlAssistant = ({
     () => ({
       databaseId: queryEditor?.dbId,
       databaseName,
+      catalog: queryEditor?.catalog,
       schema: queryEditor?.schema,
       currentSql: queryEditor?.sql,
     }),
-    [databaseName, queryEditor?.dbId, queryEditor?.schema, queryEditor?.sql],
+    [
+      databaseName,
+      queryEditor?.catalog,
+      queryEditor?.dbId,
+      queryEditor?.schema,
+      queryEditor?.sql,
+    ],
   );
 
   const {
     question,
     setQuestion,
     loading,
+    suggestingTables,
     error,
     result,
+    suggestedTables,
+    selectedTables,
+    suggestTables,
+    toggleSelectedTable,
     generateSql,
   } = useAiSqlAssistant(provider, context);
 
@@ -102,9 +114,14 @@ const AiSqlAssistant = ({
       context={context}
       question={question}
       loading={loading}
+      suggestingTables={suggestingTables}
       error={error}
       result={result}
+      suggestedTables={suggestedTables}
+      selectedTables={selectedTables}
       onQuestionChange={setQuestion}
+      onSuggestTables={suggestTables}
+      onToggleTable={toggleSelectedTable}
       onGenerate={generateSql}
       onCopy={copySql}
       onInsert={insertSql}

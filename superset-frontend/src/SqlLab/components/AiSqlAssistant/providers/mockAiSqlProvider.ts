@@ -24,8 +24,9 @@ const delay = (ms: number) =>
   });
 
 export const mockAiSqlProvider: AiSqlProvider = {
-  async generateSql({ question, context }) {
+  async generateSql({ question, context, tables }) {
     await delay(300);
+    const tableName = tables[0] ?? 'example_table';
 
     return {
       sql: [
@@ -35,14 +36,31 @@ export const mockAiSqlProvider: AiSqlProvider = {
         `-- Schema: ${context.schema ?? 'default'}`,
         'SELECT',
         '  *',
-        'FROM example_table',
+        `FROM ${tableName}`,
         'LIMIT 100;',
       ].join('\n'),
-      tables: ['example_table'],
+      tables: [tableName],
       explanation:
         'This is a placeholder response for validating the SQL Lab assistant panel.',
       warnings: ['Mock mode only. No real AutoSQL service was called.'],
     };
   },
-};
 
+  async suggestTables() {
+    await delay(200);
+
+    return {
+      tables: [
+        {
+          name: 'example_table',
+          type: 'table',
+          score: 1,
+          reason: 'Mock suggested table.',
+        },
+      ],
+      scanned_table_count: 1,
+      total_table_count: 1,
+      warnings: ['Mock mode only. No real table list was loaded.'],
+    };
+  },
+};

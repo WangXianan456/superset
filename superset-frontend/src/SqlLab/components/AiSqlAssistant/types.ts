@@ -29,6 +29,8 @@ export type AiSqlAssistantResult = {
   tables: string[];
   explanation?: string;
   warnings?: string[];
+  readonly?: boolean;
+  provider?: 'autosql' | 'mock';
 };
 
 export type GenerateSqlRequest = {
@@ -42,6 +44,12 @@ export type AiSqlSuggestedTable = {
   type?: string;
   score: number;
   reason?: string;
+  matched_columns?: {
+    name: string;
+    type?: string;
+    comment?: string;
+    score?: number;
+  }[];
 };
 
 export type SuggestTablesRequest = {
@@ -54,6 +62,10 @@ export type SuggestTablesResult = {
   tables: AiSqlSuggestedTable[];
   scanned_table_count?: number;
   total_table_count?: number;
+  metadata_index?: {
+    used: boolean;
+    updated_at?: string;
+  };
   warnings?: string[];
 };
 

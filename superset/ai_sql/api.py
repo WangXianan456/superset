@@ -24,6 +24,15 @@ from flask_appbuilder.api import expose, permission_name, protect
 from marshmallow import fields, Schema, ValidationError
 from sqlalchemy.exc import SQLAlchemyError
 
+from superset.ai_sql.services.autosql_client import (
+    AutoSqlClientError,
+    generate_sql_with_autosql,
+    is_autosql_enabled,
+)
+from superset.ai_sql.services.business_aliases import (
+    expand_question_tokens,
+    tokenize_text,
+)
 from superset.commands.database.exceptions import DatabaseNotFoundError
 from superset.commands.database.tables import TablesDatabaseCommand
 from superset.daos.database import DatabaseDAO
@@ -40,6 +49,7 @@ MAX_SUGGESTED_TABLES = 10
 MAX_TABLES_TO_SCORE = 1000
 MAX_INDEX_TABLES_PER_REFRESH = 500
 MAX_INDEX_COLUMNS_PER_TABLE = 200
+MAX_AUTO_SELECTED_TABLES = 5
 METADATA_INDEX_CACHE_TIMEOUT = 24 * 60 * 60
 MIN_TOKEN_LENGTH = 2
 TABLE_COUNT_PATTERNS = (
@@ -118,19 +128,11 @@ class AiSqlMetadataIndexSearchSchema(Schema):
 
 
 def _tokenize(text: str) -> set[str]:
-    return {
-        token.lower()
-        for token in re.findall(r"[\w\u4e00-\u9fff]+", text or "")
-        if len(token) >= MIN_TOKEN_LENGTH
-    }
+    return tokenize_text(text)
 
 
 def _question_tokens(question: str) -> set[str]:
-    tokens = _tokenize(question)
-    for keyword, aliases in BUSINESS_TOKEN_ALIASES.items():
-        if keyword in question:
-            tokens.update(aliases)
-    return tokens
+    return expand_question_tokens(question, BUSINESS_TOKEN_ALIASES)
 
 
 def _score_table(question_tokens: set[str], table_item: dict[str, Any]) -> int:
@@ -899,7 +901,38 @@ class AiSqlRestApi(BaseSupersetApi):
                         },
                     )
 
-            warnings.append("No tables were selected. Real schema context is empty.")
+            metadata_index = _get_metadata_index(database_id, catalog, schema)
+            if metadata_index is not None:
+                matched_tables = _search_metadata_index(
+                    metadata_index,
+                    question,
+                    MAX_AUTO_SELECTED_TABLES,
+                )
+                table_names = [
+                    table["name"]
+                    for table in matched_tables
+                    if table.get("name") and table.get("score", 0) > 0
+                ]
+                if table_names:
+                    schema_context["table_selection"] = {
+                        "mode": "metadata_index_auto",
+                        "updated_at": metadata_index.get("updated_at"),
+                        "matched_tables": matched_tables,
+                    }
+                    warnings.append(
+                        "No tables were manually selected. Auto-selected candidate "
+                        "tables from the AI SQL metadata index."
+                    )
+                else:
+                    warnings.append(
+                        "No tables were selected and metadata index search returned "
+                        "no candidates."
+                    )
+            else:
+                warnings.append(
+                    "No tables were selected. Real schema context is empty. Refresh "
+                    "the AI SQL metadata index to enable automatic table selection."
+                )
 
         for table_name in table_names:
             table = Table(table_name, schema, catalog)
@@ -916,17 +949,48 @@ class AiSqlRestApi(BaseSupersetApi):
                 _compact_table_metadata(table_name, schema, catalog, metadata)
             )
 
+        if schema_context["tables"] and is_autosql_enabled():
+            try:
+                autosql_result = generate_sql_with_autosql(
+                    question=question,
+                    schema_context=schema_context,
+                    current_sql=payload.get("current_sql"),
+                )
+            except AutoSqlClientError as ex:
+                logger.exception("AutoSQL generation failed.")
+                return self.response_422(message=str(ex))
+
+            result = {
+                "sql": autosql_result["sql"],
+                "tables": autosql_result["tables"]
+                or [table["name"] for table in schema_context["tables"]],
+                "explanation": autosql_result["explanation"],
+                "warnings": [
+                    *autosql_result["warnings"],
+                    *warnings,
+                ],
+                "readonly": autosql_result["readonly"],
+                "provider": "autosql",
+                "reasoning_engine": "superset_native_autosql",
+                "schema_context": schema_context,
+            }
+            return self.response(200, result=result)
+
         result = {
             "sql": _build_mock_sql(schema_context),
             "tables": [table["name"] for table in schema_context["tables"]],
             "explanation": (
                 "This is still a backend placeholder response, but it now validates "
-                "database access and builds real Superset table metadata context."
+                "database access and builds real Superset table metadata context. "
+                "Configure AI_SQL_ASSISTANT.enabled and AI_SQL_ASSISTANT.endpoint "
+                "to call the AutoSQL service."
             ),
             "warnings": [
                 "Mock SQL only. No real AutoSQL service was called.",
                 *warnings,
             ],
+            "readonly": True,
+            "provider": "mock",
             "schema_context": schema_context,
         }
         return self.response(200, result=result)

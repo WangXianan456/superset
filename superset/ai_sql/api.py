@@ -18,6 +18,7 @@ import logging
 import re
 from datetime import datetime, timezone
 from typing import Any
+from urllib.parse import urlparse
 
 from flask import current_app, request, Response
 from flask_appbuilder.api import expose, permission_name, protect
@@ -31,8 +32,10 @@ from superset.ai_sql.services.autosql_client import (
 )
 from superset.ai_sql.services.business_aliases import (
     expand_question_tokens,
+    get_business_aliases,
     tokenize_text,
 )
+from superset.ai_sql.services.llm_config import normalize_ai_sql_config
 from superset.commands.database.exceptions import DatabaseNotFoundError
 from superset.commands.database.tables import TablesDatabaseCommand
 from superset.daos.database import DatabaseDAO
@@ -65,10 +68,20 @@ TABLE_COUNT_PATTERNS = (
 FIELD_SEARCH_PATTERNS = (
     "哪些表包含",
     "哪些表有",
+    "哪些表的字段",
+    "哪些表里的字段",
+    "哪些表里有",
+    "哪些表中有",
     "哪个表包含",
     "哪个表有",
+    "哪个表的字段",
+    "哪个表里的字段",
+    "在哪些表里",
+    "在哪些表中",
     "字段在哪些表",
     "字段出现在哪些表",
+    "字段属于哪些表",
+    "字段来自哪些表",
     "column in tables",
     "tables contain",
     "tables have",
@@ -424,7 +437,14 @@ def _is_table_count_question(question: str) -> bool:
 
 def _is_field_search_question(question: str) -> bool:
     normalized_question = question.lower().replace(" ", "")
-    return any(pattern in normalized_question for pattern in FIELD_SEARCH_PATTERNS)
+    if any(pattern in normalized_question for pattern in FIELD_SEARCH_PATTERNS):
+        return True
+    return "字段" in normalized_question and (
+        "哪些表" in normalized_question
+        or "哪个表" in normalized_question
+        or "表里" in normalized_question
+        or "表中" in normalized_question
+    )
 
 
 def _build_column_search_sql(schema_name: str | None, column_names: list[str]) -> str:
@@ -531,6 +551,7 @@ class AiSqlRestApi(BaseSupersetApi):
         "suggest_tables": "read",
         "metadata_index_refresh": "read",
         "metadata_index_search": "read",
+        "config_status": "read",
     }
     allow_browser_login = True
     class_permission_name = "SQLLab"
@@ -547,6 +568,38 @@ class AiSqlRestApi(BaseSupersetApi):
     suggest_tables_schema = AiSqlSuggestTablesSchema()
     metadata_index_refresh_schema = AiSqlMetadataIndexRefreshSchema()
     metadata_index_search_schema = AiSqlMetadataIndexSearchSchema()
+
+    @expose("/config_status", methods=("GET",))
+    @protect()
+    @permission_name("read")
+    @statsd_metrics
+    def config_status(self) -> Response:
+        """Return non-secret AI SQL configuration status for troubleshooting."""
+        config = normalize_ai_sql_config()
+        endpoint = str(config.get("endpoint") or "")
+        parsed_endpoint = urlparse(endpoint)
+        endpoint_label = (
+            f"{parsed_endpoint.scheme}://{parsed_endpoint.netloc}"
+            if parsed_endpoint.scheme and parsed_endpoint.netloc
+            else None
+        )
+        return self.response(
+            200,
+            result={
+                "enabled": bool(config.get("enabled")),
+                "provider": config.get("provider"),
+                "model": config.get("model"),
+                "request_format": config.get("request_format"),
+                "endpoint_configured": bool(endpoint),
+                "endpoint": endpoint_label,
+                "authorization_configured": bool(
+                    (config.get("headers") or {}).get("Authorization")
+                ),
+                "timeout_seconds": config.get("timeout_seconds"),
+                "business_alias_count": len(get_business_aliases(BUSINESS_TOKEN_ALIASES)),
+                "metadata_index_cache_timeout": _metadata_index_cache_timeout(),
+            },
+        )
 
     @expose("/metadata_index/refresh", methods=("POST",))
     @protect()
@@ -856,50 +909,69 @@ class AiSqlRestApi(BaseSupersetApi):
             if _is_field_search_question(question):
                 metadata_index = _get_metadata_index(database_id, catalog, schema)
                 if metadata_index is None:
-                    warnings.append(
-                        "Metadata index is empty. Call metadata_index/refresh first "
-                        "to answer field-level metadata questions."
-                    )
-                else:
-                    matched_tables = _search_metadata_index(
-                        metadata_index,
-                        question,
-                        MAX_SUGGESTED_TABLES,
-                    )
-                    matched_column_names = list(
-                        dict.fromkeys(
-                            column["name"]
-                            for table in matched_tables
-                            for column in table.get("matched_columns", [])
-                            if column.get("name")
+                    try:
+                        metadata_index = _refresh_metadata_index(
+                            database_id,
+                            catalog,
+                            schema,
+                            False,
                         )
+                    except DatabaseNotFoundError:
+                        return self.response_404()
+                    warnings.append(
+                        "Metadata index was empty and has been refreshed for this "
+                        "field-level question."
                     )
-                    return self.response(
-                        200,
-                        result={
-                            "sql": _build_column_search_sql(
-                                schema,
-                                matched_column_names,
-                            ),
-                            "tables": [table["name"] for table in matched_tables],
-                            "explanation": (
-                                "Matched tables from the cached AI SQL metadata "
-                                "index. Refresh the index if recently added columns "
-                                "are missing."
-                            ),
-                            "warnings": [
-                                "No business data rows were read.",
-                                *metadata_index.get("warnings", []),
-                            ],
-                            "schema_context": {
-                                **schema_context,
-                                "metadata_index_search": {
-                                    "updated_at": metadata_index.get("updated_at"),
-                                    "matched_tables": matched_tables,
-                                },
+
+                matched_tables = _search_metadata_index(
+                    metadata_index,
+                    question,
+                    MAX_SUGGESTED_TABLES,
+                )
+                matched_column_names = list(
+                    dict.fromkeys(
+                        column["name"]
+                        for table in matched_tables
+                        for column in table.get("matched_columns", [])
+                        if column.get("name")
+                    )
+                )
+                return self.response(
+                    200,
+                    result={
+                        "sql": _build_column_search_sql(
+                            schema,
+                            matched_column_names,
+                        ),
+                        "tables": [table["name"] for table in matched_tables],
+                        "explanation": (
+                            "Matched tables from the AI SQL metadata index. "
+                            "Refresh the index if recently added columns are missing."
+                        ),
+                        "warnings": [
+                            "No business data rows were read.",
+                            *warnings,
+                            *metadata_index.get("warnings", []),
+                        ],
+                        "schema_context": {
+                            **schema_context,
+                            "metadata_index_search": {
+                                "updated_at": metadata_index.get("updated_at"),
+                                "matched_tables": matched_tables,
+                                "auto_refreshed": (
+                                    "Metadata index was empty and has been refreshed "
+                                    "for this field-level question."
+                                )
+                                in warnings,
+                                "indexed_table_count": metadata_index.get(
+                                    "indexed_table_count",
+                                    0,
+                                ),
+                                "table_count": metadata_index.get("table_count", 0),
                             },
                         },
-                    )
+                    },
+                )
 
             metadata_index = _get_metadata_index(database_id, catalog, schema)
             if metadata_index is not None:

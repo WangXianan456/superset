@@ -120,6 +120,30 @@ WEBDRIVER_BASEURL_USER_FRIENDLY = (
 )
 SQLLAB_CTAS_NO_LIMIT = True
 
+AI_SQL_ASSISTANT = {
+    "enabled": os.getenv("AI_SQL_ASSISTANT_ENABLED", "false").lower()
+    in {"1", "true", "yes", "on"},
+    "llm": {
+        "provider": os.getenv("AI_SQL_LLM_PROVIDER", "deepseek"),
+        "base_url": os.getenv("AI_SQL_LLM_BASE_URL", "https://api.deepseek.com"),
+        "wire_api": os.getenv("AI_SQL_LLM_WIRE_API", "chat/completions"),
+        "api_key_env": os.getenv("AI_SQL_LLM_API_KEY_ENV", "sk-ff46c43d9427415faf37d9b8b6f47905"),
+        "model": os.getenv("AI_SQL_LLM_MODEL", "deepseek-v4-flash"),
+        "stream": os.getenv("AI_SQL_LLM_STREAM", "false").lower()
+        in {"1", "true", "yes", "on"},
+        "timeout_seconds": int(os.getenv("AI_SQL_LLM_TIMEOUT_SECONDS", "60")),
+        "temperature": float(os.getenv("AI_SQL_LLM_TEMPERATURE", "0.1")),
+    },
+    "default_sql_limit": int(os.getenv("AI_SQL_DEFAULT_SQL_LIMIT", "100")),
+    "max_sql_limit": int(os.getenv("AI_SQL_MAX_SQL_LIMIT", "1000")),
+}
+
+AI_SQL_BUSINESS_ALIASES = {
+    "酒店": ["hotel", "hotel_id", "hotel_name", "pvhotelid"],
+    "评论": ["comment", "review", "comment_context"],
+    "评分": ["score", "rating", "comment_score"],
+}
+
 log_level_text = os.getenv("SUPERSET_LOG_LEVEL", "INFO")
 LOG_LEVEL = getattr(logging, log_level_text.upper(), logging.INFO)
 

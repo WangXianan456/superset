@@ -21,6 +21,8 @@ import { getClientErrorObject, SupersetClient } from '@superset-ui/core';
 import type {
   AiSqlAssistantResult,
   AiSqlProvider,
+  FeedbackRequest,
+  MetadataStatus,
   SuggestTablesResult,
 } from '../types';
 
@@ -72,6 +74,64 @@ export const httpAiSqlProvider: AiSqlProvider = {
         parsedError.message ||
           parsedError.error ||
           t('Failed to suggest tables.'),
+      );
+    }
+  },
+
+  async refreshMetadata(context) {
+    try {
+      const { json } = await SupersetClient.post({
+        endpoint: '/api/v1/ai_sql/metadata_index/refresh',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          database_id: context.databaseId,
+          catalog: context.catalog,
+          schema: context.schema,
+          force: false,
+        }),
+      });
+
+      const result = json.result as {
+        updated_at?: string;
+        table_count?: number;
+        indexed_table_count?: number;
+        supersql_synced?: boolean;
+        supersql_status?: {
+          columns_upserted?: number;
+        };
+        warnings?: string[];
+      };
+      return {
+        synced: result.supersql_synced === true,
+        updatedAt: result.updated_at,
+        tableCount: result.table_count,
+        indexedTableCount: result.indexed_table_count,
+        columnsUpserted: result.supersql_status?.columns_upserted,
+        warnings: result.warnings,
+      } as MetadataStatus;
+    } catch (error) {
+      const parsedError = await getClientErrorObject(error);
+      throw new Error(
+        parsedError.message ||
+          parsedError.error ||
+          t('Failed to refresh metadata.'),
+      );
+    }
+  },
+
+  async sendFeedback(request: FeedbackRequest) {
+    try {
+      await SupersetClient.post({
+        endpoint: '/api/v1/ai_sql/feedback',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(request),
+      });
+    } catch (error) {
+      const parsedError = await getClientErrorObject(error);
+      throw new Error(
+        parsedError.message ||
+          parsedError.error ||
+          t('Failed to send feedback.'),
       );
     }
   },

@@ -14,15 +14,19 @@
 # KIND, either express or implied.  See the License for the
 # specific language governing permissions and limitations
 # under the License.
+import hashlib
 import logging
 import re
+import traceback
 from datetime import datetime, timezone
 from typing import Any
 from urllib.parse import urlparse
 
-from flask import current_app, request, Response
+from flask import Response, current_app, g, request
 from flask_appbuilder.api import expose, permission_name, protect
 from marshmallow import fields, Schema, ValidationError
+from concurrent.futures import ThreadPoolExecutor
+from sqlalchemy import column, func, select, table as sqlalchemy_table, text
 from sqlalchemy.exc import SQLAlchemyError
 
 from superset.ai_sql.services.autosql_client import (
@@ -36,6 +40,15 @@ from superset.ai_sql.services.business_aliases import (
     tokenize_text,
 )
 from superset.ai_sql.services.llm_config import normalize_ai_sql_config
+from superset.ai_sql.services.supersql_client import (
+    SupersqlClientError,
+    diff_metadata as diff_metadata_with_supersql,
+    feedback as feedback_with_supersql,
+    generate_sql as generate_sql_with_supersql,
+    is_supersql_enabled,
+    search_metadata as search_metadata_with_supersql,
+    sync_metadata as sync_metadata_with_supersql,
+)
 from superset.commands.database.exceptions import DatabaseNotFoundError
 from superset.commands.database.tables import TablesDatabaseCommand
 from superset.daos.database import DatabaseDAO
@@ -138,6 +151,16 @@ class AiSqlMetadataIndexSearchSchema(Schema):
     catalog = fields.String(allow_none=True)
     schema = fields.String(allow_none=True)
     limit = fields.Integer(load_default=MAX_SUGGESTED_TABLES)
+
+
+class AiSqlFeedbackSchema(Schema):
+    request_id = fields.String(required=True)
+    accepted = fields.Boolean(allow_none=True)
+    copied = fields.Boolean(allow_none=True)
+    inserted = fields.Boolean(allow_none=True)
+    executed_successfully = fields.Boolean(allow_none=True)
+    user_modified_sql = fields.String(allow_none=True)
+    feedback_text = fields.String(allow_none=True)
 
 
 def _tokenize(text: str) -> set[str]:
@@ -269,15 +292,208 @@ def _build_search_text(table_summary: dict[str, Any]) -> str:
     return " ".join(str(part) for part in parts if part)
 
 
+def _probe_schema_signatures(
+    database: Any,
+    schema: str | None,
+) -> dict[str, str]:
+    signatures: dict[str, str] = {}
+    try:
+        with database.get_sqla_engine() as engine:
+            with engine.connect() as connection:
+                if engine.dialect.name == "mysql":
+                    tables_sql = text(
+                        "SELECT TABLE_NAME, TABLE_TYPE, TABLE_COMMENT "
+                        "FROM information_schema.tables WHERE TABLE_SCHEMA = :schema"
+                    )
+                    columns_sql = text(
+                        "SELECT TABLE_NAME, COLUMN_NAME, DATA_TYPE, "
+                        "COLUMN_COMMENT, ORDINAL_POSITION, IS_NULLABLE "
+                        "FROM information_schema.columns "
+                        "WHERE TABLE_SCHEMA = :schema "
+                        "ORDER BY TABLE_NAME, ORDINAL_POSITION"
+                    )
+                else:
+                    tables_sql = text(
+                        "SELECT table_name, table_type, NULL "
+                        "FROM information_schema.tables WHERE table_schema = :schema"
+                    )
+                    columns_sql = text(
+                        "SELECT table_name, column_name, data_type, NULL, "
+                        "ordinal_position, is_nullable "
+                        "FROM information_schema.columns "
+                        "WHERE table_schema = :schema "
+                        "ORDER BY table_name, ordinal_position"
+                    )
+                table_info: dict[str, tuple[str, str]] = {}
+                for row in connection.execute(tables_sql, {"schema": schema or ""}):
+                    table_info[str(row[0])] = (str(row[1] or ""), str(row[2] or ""))
+                columns: dict[str, list[tuple[str, str, str, int, str]]] = {}
+                for row in connection.execute(columns_sql, {"schema": schema or ""}):
+                    columns.setdefault(str(row[0]), []).append(
+                        (
+                            str(row[1]),
+                            str(row[2]),
+                            str(row[3] or ""),
+                            int(row[4] or 0),
+                            str(row[5] or ""),
+                        )
+                    )
+    except SQLAlchemyError:
+        logger.exception("Unable to probe schema signatures.")
+        return {}
+    for table_name in table_info:
+        table_type, comment = table_info[table_name]
+        parts: list[object] = [table_type, comment]
+        parts.extend(columns.get(table_name, []))
+        signatures[table_name] = hashlib.sha256(
+            repr(parts).encode("utf-8")
+        ).hexdigest()[:32]
+    return signatures
+
+
+_TIME_COLUMN_PATTERNS = (
+    ("created_time", 10),
+    ("createtime", 10),
+    ("created", 9),
+    ("start_time", 9),
+    ("starttime", 9),
+    ("start_date", 9),
+    ("date", 6),
+    ("time", 6),
+    ("update", 5),
+    ("ts", 5),
+    ("end", 2),
+)
+_TIME_TYPE_HINTS = ("date", "time", "timestamp", "datetime")
+
+
+def _candidate_time_column(columns: list[dict[str, Any]]) -> str | None:
+    best_name: str | None = None
+    best_score = -1
+    for column_meta in columns:
+        name = str(column_meta.get("name") or "")
+        lowered = name.lower()
+        score = 0
+        for pattern, weight in _TIME_COLUMN_PATTERNS:
+            if pattern in lowered:
+                score = max(score, weight)
+        if "end" in lowered:
+            score -= 2
+        if any(keyword in lowered for keyword in ("type", "flag", "status", "code")):
+            score -= 4
+        column_type = str(column_meta.get("type") or "").lower()
+        if any(hint in column_type for hint in _TIME_TYPE_HINTS):
+            score += 5
+        if score > best_score:
+            best_score = score
+            best_name = name
+    return best_name if best_score > 0 else None
+
+
+def _table_time_range(
+    database: Any,
+    table_name: str,
+    schema: str | None,
+    time_column: str,
+) -> tuple[str | None, str | None]:
+    try:
+        with database.get_sqla_engine() as engine:
+            preparer = engine.dialect.identifier_preparer
+            quoted_column = preparer.quote(time_column)
+            quoted_table = preparer.quote(table_name)
+            quoted_schema = (
+                preparer.quote_schema(schema) if schema else None
+            )
+            from_clause = (
+                f"{quoted_schema}.{quoted_table}"
+                if quoted_schema
+                else quoted_table
+            )
+            if engine.dialect.name == "mysql":
+                sql = (
+                    "SELECT /*+ MAX_EXECUTION_TIME(15000) */ "
+                    f"MIN({quoted_column}), MAX({quoted_column}) "
+                    f"FROM {from_clause}"
+                )
+            else:
+                sql = (
+                    f"SELECT MIN({quoted_column}), MAX({quoted_column}) "
+                    f"FROM {from_clause}"
+                )
+            with engine.connect() as connection:
+                if engine.dialect.name == "postgresql":
+                    connection.execute(
+                        text("SET LOCAL statement_timeout = '15s'")
+                    )
+                row = connection.execute(text(sql)).first()
+        if row is None:
+            return None, None
+        min_str = str(row[0]) if row[0] is not None else None
+        max_str = str(row[1]) if row[1] is not None else None
+        if min_str in (None, "", "0") and max_str in (None, "", "0"):
+            return None, None
+        return min_str, max_str
+    except Exception:
+        logger.exception(
+            "Unable to profile time column %s for %s",
+            time_column,
+            table_name,
+        )
+        with open("/tmp/superset_profile.log", "a", encoding="utf-8") as log_file:
+            log_file.write(traceback.format_exc())
+        return None, None
+
+
+def _profile_index_tables(
+    database: Any,
+    index_tables: list[dict[str, Any]],
+    schema: str | None,
+) -> None:
+    if not index_tables:
+        return
+    app = current_app._get_current_object()
+
+    def profile_one(table_summary: dict[str, Any]) -> None:
+        with app.app_context():
+            _profile_one_table(database, schema, table_summary)
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        list(executor.map(profile_one, index_tables))
+
+
+def _profile_one_table(
+    database: Any,
+    schema: str | None,
+    table_summary: dict[str, Any],
+) -> None:
+    time_column = table_summary.get("_time_column")
+    table_summary.pop("_time_column", None)
+    if not time_column:
+        table_summary["data_time_min"] = None
+        table_summary["data_time_max"] = None
+        return
+    min_value, max_value = _table_time_range(
+        database,
+        str(table_summary.get("name") or ""),
+        schema,
+        str(time_column),
+    )
+    table_summary["data_time_min"] = min_value
+    table_summary["data_time_max"] = max_value
+
+
 def _refresh_metadata_index(
     database_id: int,
     catalog: str | None,
     schema: str | None,
     force: bool,
+    only_tables: list[str] | None = None,
 ) -> dict[str, Any]:
     database = DatabaseDAO.find_by_id(database_id)
     if database is None:
         raise DatabaseNotFoundError()
+
+    signatures = _probe_schema_signatures(database, schema)
 
     tables_payload = TablesDatabaseCommand(
         database_id,
@@ -287,6 +503,13 @@ def _refresh_metadata_index(
     ).run()
     warnings = []
     accessible_tables = tables_payload.get("result", [])
+    if only_tables is not None:
+        only_set = set(only_tables)
+        accessible_tables = [
+            item
+            for item in accessible_tables
+            if str(item.get("value") or "") in only_set
+        ]
     if tables_payload.get("count", 0) > MAX_INDEX_TABLES_PER_REFRESH:
         warnings.append(
             "Only the first "
@@ -312,12 +535,19 @@ def _refresh_metadata_index(
             continue
 
         all_columns = metadata.get("columns", [])
+        data_time_min = None
+        data_time_max = None
+        time_column = _candidate_time_column(all_columns)
         table_summary = {
             "name": table_name,
             "type": table_item.get("type"),
             "schema": schema,
             "catalog": catalog,
             "comment": metadata.get("comment"),
+            "data_time_min": data_time_min,
+            "data_time_max": data_time_max,
+            "structure_signature": signatures.get(table_name),
+            "_time_column": time_column,
             "columns": [
                 _column_summary(column)
                 for column in all_columns[:MAX_INDEX_COLUMNS_PER_TABLE]
@@ -327,6 +557,14 @@ def _refresh_metadata_index(
         }
         table_summary["search_text"] = _build_search_text(table_summary)
         index_tables.append(table_summary)
+
+    if current_app.config.get("AI_SQL_PROFILE_TIME_COLUMNS", True):
+        try:
+            _profile_index_tables(database, index_tables, schema)
+        except Exception:
+            logger.exception("time profiling failed; continuing without profiles")
+            with open("/tmp/superset_profile.log", "a", encoding="utf-8") as log_file:
+                log_file.write(traceback.format_exc())
 
     metadata_index = {
         "database_id": database.id,
@@ -342,8 +580,22 @@ def _refresh_metadata_index(
         "tables": index_tables,
         "warnings": warnings,
     }
+    cache_key = _metadata_index_cache_key(database_id, catalog, schema)
+    if only_tables is not None:
+        existing_index = cache_manager.cache.get(cache_key)
+        if isinstance(existing_index, dict):
+            existing_tables = {
+                str(table.get("name")): table
+                for table in existing_index.get("tables", [])
+            }
+            for table in index_tables:
+                existing_tables[str(table.get("name"))] = table
+            metadata_index["tables"] = list(existing_tables.values())
+            metadata_index["indexed_table_count"] = len(
+                metadata_index["tables"]
+            )
     cache_manager.cache.set(
-        _metadata_index_cache_key(database_id, catalog, schema),
+        cache_key,
         metadata_index,
         timeout=_metadata_index_cache_timeout(),
     )
@@ -545,6 +797,25 @@ def _build_mock_sql(schema_context: dict[str, Any]) -> str:
     )
 
 
+def _supersql_generate_result(
+    supersql_result: dict[str, Any],
+    schema_context: dict[str, Any],
+) -> dict[str, Any]:
+    return {
+        "sql": supersql_result["sql"],
+        "tables": supersql_result.get("tables")
+        or [table["name"] for table in schema_context.get("tables", [])],
+        "explanation": supersql_result.get("explanation", ""),
+        "warnings": supersql_result.get("warnings", []),
+        "readonly": True,
+        "provider": supersql_result.get("provider", "supersql"),
+        "model": supersql_result.get("model"),
+        "retrieval": supersql_result.get("retrieval"),
+        "request_id": supersql_result.get("request_id"),
+        "schema_context": {**schema_context, "source": "supersql"},
+    }
+
+
 class AiSqlRestApi(BaseSupersetApi):
     method_permission_name = {
         "generate": "read",
@@ -552,6 +823,7 @@ class AiSqlRestApi(BaseSupersetApi):
         "metadata_index_refresh": "read",
         "metadata_index_search": "read",
         "config_status": "read",
+        "feedback": "read",
     }
     allow_browser_login = True
     class_permission_name = "SQLLab"
@@ -568,6 +840,7 @@ class AiSqlRestApi(BaseSupersetApi):
     suggest_tables_schema = AiSqlSuggestTablesSchema()
     metadata_index_refresh_schema = AiSqlMetadataIndexRefreshSchema()
     metadata_index_search_schema = AiSqlMetadataIndexSearchSchema()
+    feedback_schema = AiSqlFeedbackSchema()
 
     @expose("/config_status", methods=("GET",))
     @protect()
@@ -619,15 +892,114 @@ class AiSqlRestApi(BaseSupersetApi):
         except ValidationError as error:
             return self.response_400(message=error.messages)
 
+        incremental = not payload["force"] and is_supersql_enabled()
+        changed_tables: list[str] | None = None
+        diff_result: dict[str, object] | None = None
+        if incremental:
+            try:
+                database = DatabaseDAO.find_by_id(payload["database_id"])
+                if database is not None:
+                    signatures = _probe_schema_signatures(
+                        database,
+                        payload.get("schema"),
+                    )
+                    diff_result = diff_metadata_with_supersql(
+                        database_id=payload["database_id"],
+                        catalog=payload.get("catalog"),
+                        schema=payload.get("schema"),
+                        signatures=signatures,
+                    )
+                    changed_tables = list(diff_result.get("changed", []))
+            except SupersqlClientError as exc:
+                logger.exception("supersqlApp diff failed; falling back to full refresh.")
+                incremental = False
+                changed_tables = None
+            except Exception:
+                logger.exception("incremental probe failed; falling back to full refresh.")
+                incremental = False
+                changed_tables = None
+
+            if incremental and not changed_tables:
+                return self.response(
+                    200,
+                    result={
+                        "database_id": payload["database_id"],
+                        "catalog": payload.get("catalog"),
+                        "schema": payload.get("schema"),
+                        "incremental": True,
+                        "changed": 0,
+                        "unchanged": (diff_result or {}).get("unchanged", 0),
+                        "removed": (diff_result or {}).get("removed", []),
+                        "updated_at": None,
+                        "table_count": 0,
+                        "indexed_table_count": 0,
+                        "warnings": ["元数据没有变化，跳过刷新。"],
+                    },
+                )
+
         try:
             metadata_index = _refresh_metadata_index(
                 payload["database_id"],
                 payload.get("catalog"),
                 payload.get("schema"),
                 payload["force"],
+                only_tables=changed_tables,
             )
         except DatabaseNotFoundError:
             return self.response_404()
+
+        warnings = list(metadata_index["warnings"])
+        supersql_synced = False
+        supersql_status = None
+        if is_supersql_enabled():
+            try:
+                sync_tables = [
+                    {
+                        "name": table["name"],
+                        "table_type": str(table.get("type") or "table"),
+                        "description": table.get("comment"),
+                        "data_time_min": table.get("data_time_min"),
+                        "data_time_max": table.get("data_time_max"),
+                        "structure_signature": table.get("structure_signature"),
+                        "columns": [
+                            {
+                                "name": column.get("name"),
+                                "data_type": column.get("type")
+                                or column.get("long_type")
+                                or "text",
+                                "description": column.get("comment"),
+                                "is_primary_key": bool(column.get("primary_key")),
+                            }
+                            for column in table.get("columns", [])
+                        ],
+                    }
+                    for table in metadata_index["tables"]
+                ]
+                if incremental and changed_tables:
+                    changed_set = set(changed_tables)
+                    sync_tables = [
+                        item for item in sync_tables if item["name"] in changed_set
+                    ]
+                sync_result = sync_metadata_with_supersql(
+                    database_id=payload["database_id"],
+                    database_name=metadata_index["database_name"],
+                    dialect=metadata_index["dialect"],
+                    catalog=payload.get("catalog"),
+                    schema=payload.get("schema"),
+                    tables=sync_tables,
+                    metadata_version=metadata_index["updated_at"],
+                    incremental=incremental,
+                )
+                supersql_synced = True
+                supersql_status = {
+                    "tables_upserted": sync_result.get("tables_upserted", 0),
+                    "tables_removed": sync_result.get("tables_removed", 0),
+                    "columns_upserted": sync_result.get("columns_upserted", 0),
+                    "columns_removed": sync_result.get("columns_removed", 0),
+                }
+            except SupersqlClientError as exc:
+                logger.exception("supersqlApp metadata sync failed.")
+                warnings.append(f"supersqlApp sync skipped: {exc}")
 
         return self.response(
             200,
@@ -643,7 +1015,11 @@ class AiSqlRestApi(BaseSupersetApi):
                 "max_indexed_columns_per_table": metadata_index[
                     "max_indexed_columns_per_table"
                 ],
-                "warnings": metadata_index["warnings"],
+                "warnings": warnings,
+                "supersql_synced": supersql_synced,
+                "supersql_status": supersql_status,
+                "incremental": incremental,
+                "changed": len(changed_tables) if changed_tables else 0,
             },
         )
 
@@ -670,6 +1046,48 @@ class AiSqlRestApi(BaseSupersetApi):
             return self.response_400(message="Question is required.")
 
         limit = max(1, min(payload["limit"], MAX_SUGGESTED_TABLES))
+        warnings: list[str] = []
+        if is_supersql_enabled():
+            try:
+                supersql_result = search_metadata_with_supersql(
+                    database_id=payload["database_id"],
+                    catalog=payload.get("catalog"),
+                    schema=payload.get("schema"),
+                    query=question,
+                    limit=limit,
+                )
+                if supersql_result.get("index_ready"):
+                    supersql_tables = [
+                        {
+                            "name": item["table"],
+                            "score": item.get("score", 0),
+                            "reason": item.get("reason", ""),
+                            "matched_columns": [
+                                {"name": column}
+                                for column in item.get("matched_columns", [])
+                            ],
+                        }
+                        for item in supersql_result.get("matched_tables", [])
+                    ]
+                    return self.response(
+                        200,
+                        result={
+                            "database_id": payload["database_id"],
+                            "catalog": payload.get("catalog"),
+                            "schema": payload.get("schema"),
+                            "tables": supersql_tables,
+                            "index_found": True,
+                            "source": "supersql",
+                            "metadata_version": supersql_result.get(
+                                "metadata_version"
+                            ),
+                            "warnings": [],
+                        },
+                    )
+            except SupersqlClientError as exc:
+                logger.exception("supersqlApp metadata search failed.")
+                warnings.append(f"supersqlApp search skipped: {exc}")
+
         metadata_index = _get_metadata_index(
             payload["database_id"],
             payload.get("catalog"),
@@ -685,7 +1103,8 @@ class AiSqlRestApi(BaseSupersetApi):
                     "tables": [],
                     "index_found": False,
                     "warnings": [
-                        "Metadata index is empty. Call metadata_index/refresh first."
+                        "Metadata index is empty. Call metadata_index/refresh first.",
+                        *warnings,
                     ],
                 },
             )
@@ -700,7 +1119,10 @@ class AiSqlRestApi(BaseSupersetApi):
                 "index_found": True,
                 "updated_at": metadata_index.get("updated_at"),
                 "indexed_table_count": metadata_index.get("indexed_table_count", 0),
-                "warnings": metadata_index.get("warnings", []),
+                "warnings": [
+                    *metadata_index.get("warnings", []),
+                    *warnings,
+                ],
             },
         )
 
@@ -727,6 +1149,44 @@ class AiSqlRestApi(BaseSupersetApi):
             return self.response_400(message="Question is required.")
 
         limit = max(1, min(payload["limit"], MAX_SUGGESTED_TABLES))
+        if is_supersql_enabled():
+            try:
+                supersql_result = search_metadata_with_supersql(
+                    database_id=payload["database_id"],
+                    catalog=payload.get("catalog"),
+                    schema=payload.get("schema"),
+                    query=question,
+                    limit=limit,
+                )
+                if supersql_result.get("index_ready"):
+                    supersql_tables = [
+                        {
+                            "name": item["table"],
+                            "score": item.get("score", 0),
+                            "reason": item.get("reason", ""),
+                            "matched_columns": [
+                                {"name": column}
+                                for column in item.get("matched_columns", [])
+                            ],
+                        }
+                        for item in supersql_result.get("matched_tables", [])
+                    ]
+                    return self.response(
+                        200,
+                        result={
+                            "database_id": payload["database_id"],
+                            "catalog": payload.get("catalog"),
+                            "schema": payload.get("schema"),
+                            "tables": supersql_tables,
+                            "scanned_table_count": len(supersql_tables),
+                            "total_table_count": len(supersql_tables),
+                            "metadata_index": {"used": False, "supersql": True},
+                            "warnings": [],
+                        },
+                    )
+            except SupersqlClientError as exc:
+                logger.exception("supersqlApp suggest_tables failed.")
+
         metadata_index = _get_metadata_index(
             payload["database_id"],
             payload.get("catalog"),
@@ -866,6 +1326,34 @@ class AiSqlRestApi(BaseSupersetApi):
             "tables": [],
         }
         warnings = []
+
+        if (
+            is_supersql_enabled()
+            and not _is_table_count_question(question)
+            and not _is_field_search_question(question)
+        ):
+            try:
+                supersql_result = generate_sql_with_supersql(
+                    database_id=database_id,
+                    database_name=schema_context["database_name"],
+                    dialect=schema_context["dialect"],
+                    catalog=catalog,
+                    schema=schema,
+                    question=question,
+                    allowed_tables=table_names,
+                    allowed_columns={},
+                    current_sql=payload.get("current_sql"),
+                )
+                return self.response(
+                    200,
+                    result=_supersql_generate_result(
+                        supersql_result,
+                        schema_context,
+                    ),
+                )
+            except SupersqlClientError as exc:
+                logger.exception("supersqlApp SQL generation failed.")
+                warnings.append(f"supersqlApp generate skipped: {exc}")
 
         if not table_names:
             if _is_table_count_question(question):
@@ -1066,3 +1554,43 @@ class AiSqlRestApi(BaseSupersetApi):
             "schema_context": schema_context,
         }
         return self.response(200, result=result)
+
+    @expose("/feedback", methods=("POST",))
+    @protect()
+    @permission_name("read")
+    @statsd_metrics
+    @requires_json
+    @event_logger.log_this_with_context(
+        action=lambda self, *args, **kwargs: (
+            f"{self.__class__.__name__}.feedback"
+        ),
+        log_to_statsd=False,
+    )
+    def feedback(self) -> Response:
+        """Record user feedback for a generated SQL result."""
+        try:
+            payload = self.feedback_schema.load(request.json)
+        except ValidationError as error:
+            return self.response_400(message=error.messages)
+
+        if not is_supersql_enabled():
+            return self.response_422(message="supersqlApp is not enabled.")
+
+        try:
+            feedback_with_supersql(
+                request_id=payload["request_id"],
+                accepted=payload.get("accepted"),
+                copied=payload.get("copied"),
+                inserted=payload.get("inserted"),
+                executed_successfully=payload.get("executed_successfully"),
+                user_modified_sql=payload.get("user_modified_sql"),
+                feedback_text=payload.get("feedback_text"),
+            )
+        except SupersqlClientError as exc:
+            logger.exception("supersqlApp feedback failed.")
+            return self.response(502, message=str(exc))
+
+        return self.response(
+            200,
+            result={"request_id": payload["request_id"], "recorded": True},
+        )

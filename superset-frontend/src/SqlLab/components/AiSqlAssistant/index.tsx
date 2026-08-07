@@ -22,4 +22,3 @@ export type {
   AiSqlAssistantResult,
   AiSqlProvider,
 } from './types';
-

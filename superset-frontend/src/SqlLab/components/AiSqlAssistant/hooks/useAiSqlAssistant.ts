@@ -22,6 +22,8 @@ import type {
   AiSqlAssistantResult,
   AiSqlSuggestedTable,
   AiSqlProvider,
+  FeedbackRequest,
+  MetadataStatus,
 } from '../types';
 
 export const useAiSqlAssistant = (
@@ -31,12 +33,38 @@ export const useAiSqlAssistant = (
   const [question, setQuestion] = useState('');
   const [loading, setLoading] = useState(false);
   const [suggestingTables, setSuggestingTables] = useState(false);
+  const [refreshing, setRefreshing] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [result, setResult] = useState<AiSqlAssistantResult | null>(null);
   const [suggestedTables, setSuggestedTables] = useState<AiSqlSuggestedTable[]>(
     [],
   );
   const [selectedTables, setSelectedTables] = useState<string[]>([]);
+  const [metadataStatus, setMetadataStatus] = useState<MetadataStatus | null>(
+    null,
+  );
+  const [feedbackSent, setFeedbackSent] = useState(false);
+
+  const refreshMetadata = useCallback(async () => {
+    if (!context.databaseId) {
+      setError('Select a database first.');
+      return;
+    }
+
+    setRefreshing(true);
+    setError(null);
+
+    try {
+      const status = await provider.refreshMetadata(context);
+      setMetadataStatus(status);
+    } catch (err) {
+      setError(
+        err instanceof Error ? err.message : 'Failed to refresh metadata.',
+      );
+    } finally {
+      setRefreshing(false);
+    }
+  }, [context, provider]);
 
   const suggestTables = useCallback(async () => {
     const trimmedQuestion = question.trim();
@@ -61,7 +89,9 @@ export const useAiSqlAssistant = (
       setSuggestedTables(response.tables);
       setSelectedTables(response.tables.map(table => table.name));
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to suggest tables.');
+      setError(
+        err instanceof Error ? err.message : 'Failed to suggest tables.',
+      );
     } finally {
       setSuggestingTables(false);
     }
@@ -84,6 +114,7 @@ export const useAiSqlAssistant = (
 
     setLoading(true);
     setError(null);
+    setFeedbackSent(false);
 
     try {
       const response = await provider.generateSql({
@@ -99,17 +130,43 @@ export const useAiSqlAssistant = (
     }
   }, [context, provider, question, selectedTables]);
 
+  const sendFeedback = useCallback(
+    async (feedback: Omit<FeedbackRequest, 'request_id'>) => {
+      if (!result?.request_id || feedbackSent) {
+        return;
+      }
+
+      try {
+        await provider.sendFeedback({
+          request_id: result.request_id,
+          ...feedback,
+        });
+        setFeedbackSent(true);
+      } catch (err) {
+        setError(
+          err instanceof Error ? err.message : 'Failed to send feedback.',
+        );
+      }
+    },
+    [feedbackSent, provider, result?.request_id],
+  );
+
   return {
     question,
     setQuestion,
     loading,
     suggestingTables,
+    refreshing,
     error,
     result,
     suggestedTables,
     selectedTables,
+    metadataStatus,
+    feedbackSent,
+    refreshMetadata,
     suggestTables,
     toggleSelectedTable,
     generateSql,
+    sendFeedback,
   };
 };

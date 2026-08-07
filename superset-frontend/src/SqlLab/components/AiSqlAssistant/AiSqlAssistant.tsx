@@ -41,26 +41,31 @@ const AiSqlAssistant = ({
   const { queryEditor, databaseName } = useSelector<
     SqlLabRootState,
     { queryEditor?: QueryEditor; databaseName?: string }
-  >(({ sqlLab: { databases, queryEditors, tabHistory, unsavedQueryEditor } }) => {
-    const queryEditorId = tabHistory.slice(-1)[0];
-    const savedQueryEditor = queryEditors.find(
-      editor => editor.id === queryEditorId,
-    );
-    const mergedQueryEditor = savedQueryEditor
-      ? {
-          ...savedQueryEditor,
-          ...(unsavedQueryEditor?.id === savedQueryEditor.id &&
-            unsavedQueryEditor),
-        }
-      : undefined;
+  >(
+    ({
+      sqlLab: { databases, queryEditors, tabHistory, unsavedQueryEditor },
+    }) => {
+      const queryEditorId = tabHistory.slice(-1)[0];
+      const savedQueryEditor = queryEditors.find(
+        editor => editor.id === queryEditorId,
+      );
+      const mergedQueryEditor = savedQueryEditor
+        ? {
+            ...savedQueryEditor,
+            ...(unsavedQueryEditor?.id === savedQueryEditor.id &&
+              unsavedQueryEditor),
+          }
+        : undefined;
 
-    return {
-      queryEditor: mergedQueryEditor,
-      databaseName: mergedQueryEditor?.dbId
-        ? databases[mergedQueryEditor.dbId]?.database_name
-        : undefined,
-    };
-  }, shallowEqual);
+      return {
+        queryEditor: mergedQueryEditor,
+        databaseName: mergedQueryEditor?.dbId
+          ? databases[mergedQueryEditor.dbId]?.database_name
+          : undefined,
+      };
+    },
+    shallowEqual,
+  );
 
   const context = useMemo<AiSqlAssistantContext>(
     () => ({
@@ -84,13 +89,18 @@ const AiSqlAssistant = ({
     setQuestion,
     loading,
     suggestingTables,
+    refreshing,
     error,
     result,
     suggestedTables,
     selectedTables,
+    metadataStatus,
+    feedbackSent,
+    refreshMetadata,
     suggestTables,
     toggleSelectedTable,
     generateSql,
+    sendFeedback,
   } = useAiSqlAssistant(provider, context);
 
   const copySql = useCallback(() => {
@@ -99,15 +109,27 @@ const AiSqlAssistant = ({
     }
 
     copyTextToClipboard(() => Promise.resolve(result.sql))
-      .then(() => addSuccessToast(t('Copied to clipboard!')))
+      .then(() => {
+        addSuccessToast(t('Copied to clipboard!'));
+        sendFeedback({ copied: true, accepted: true });
+      })
       .catch(() => addDangerToast(t('Failed to copy SQL.')));
-  }, [addDangerToast, addSuccessToast, result?.sql]);
+  }, [addDangerToast, addSuccessToast, result?.sql, sendFeedback]);
 
   const insertSql = useCallback(() => {
     if (queryEditor && result?.sql) {
       dispatch(queryEditorSetAndSaveSql(queryEditor, result.sql, undefined));
+      sendFeedback({ inserted: true, accepted: true });
     }
-  }, [dispatch, queryEditor, result?.sql]);
+  }, [dispatch, queryEditor, result?.sql, sendFeedback]);
+
+  const acceptResult = useCallback(() => {
+    sendFeedback({ accepted: true });
+  }, [sendFeedback]);
+
+  const rejectResult = useCallback(() => {
+    sendFeedback({ accepted: false });
+  }, [sendFeedback]);
 
   return (
     <AiSqlAssistantPanel
@@ -115,14 +137,20 @@ const AiSqlAssistant = ({
       question={question}
       loading={loading}
       suggestingTables={suggestingTables}
+      refreshing={refreshing}
       error={error}
       result={result}
       suggestedTables={suggestedTables}
       selectedTables={selectedTables}
+      metadataStatus={metadataStatus}
+      feedbackSent={feedbackSent}
       onQuestionChange={setQuestion}
       onSuggestTables={suggestTables}
       onToggleTable={toggleSelectedTable}
       onGenerate={generateSql}
+      onRefreshMetadata={refreshMetadata}
+      onAcceptResult={acceptResult}
+      onRejectResult={rejectResult}
       onCopy={copySql}
       onInsert={insertSql}
     />

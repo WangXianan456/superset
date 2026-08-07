@@ -30,7 +30,22 @@ export type AiSqlAssistantResult = {
   explanation?: string;
   warnings?: string[];
   readonly?: boolean;
-  provider?: 'autosql' | 'mock';
+  provider?: string;
+  model?: string;
+  request_id?: string;
+  retrieval?: AiSqlRetrieval;
+};
+
+export type AiSqlRetrieval = {
+  mode?: string;
+  candidates?: AiSqlRetrievalCandidate[];
+};
+
+export type AiSqlRetrievalCandidate = {
+  table: string;
+  score?: number;
+  reason?: string;
+  matched_columns?: string[];
 };
 
 export type GenerateSqlRequest = {
@@ -39,17 +54,19 @@ export type GenerateSqlRequest = {
   tables: string[];
 };
 
+export type AiSqlSuggestedColumn = {
+  name: string;
+  type?: string;
+  comment?: string;
+  score?: number;
+};
+
 export type AiSqlSuggestedTable = {
   name: string;
   type?: string;
   score: number;
   reason?: string;
-  matched_columns?: {
-    name: string;
-    type?: string;
-    comment?: string;
-    score?: number;
-  }[];
+  matched_columns?: AiSqlSuggestedColumn[];
 };
 
 export type SuggestTablesRequest = {
@@ -69,11 +86,30 @@ export type SuggestTablesResult = {
   warnings?: string[];
 };
 
+export type MetadataStatus = {
+  synced: boolean;
+  updatedAt?: string;
+  tableCount?: number;
+  indexedTableCount?: number;
+  columnsUpserted?: number;
+  warnings?: string[];
+};
+
+export type FeedbackRequest = {
+  request_id: string;
+  accepted?: boolean;
+  copied?: boolean;
+  inserted?: boolean;
+  executed_successfully?: boolean;
+  user_modified_sql?: string;
+  feedback_text?: string;
+};
+
 export type AiSqlProvider = {
-  generateSql: (
-    request: GenerateSqlRequest,
-  ) => Promise<AiSqlAssistantResult>;
+  generateSql: (request: GenerateSqlRequest) => Promise<AiSqlAssistantResult>;
   suggestTables: (
     request: SuggestTablesRequest,
   ) => Promise<SuggestTablesResult>;
+  refreshMetadata: (context: AiSqlAssistantContext) => Promise<MetadataStatus>;
+  sendFeedback: (request: FeedbackRequest) => Promise<void>;
 };

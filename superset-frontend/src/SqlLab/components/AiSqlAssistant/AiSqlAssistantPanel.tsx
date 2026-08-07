@@ -25,6 +25,7 @@ import type {
   AiSqlAssistantContext,
   AiSqlAssistantResult,
   AiSqlSuggestedTable,
+  MetadataStatus,
 } from './types';
 
 const Panel = styled.div`
@@ -72,6 +73,18 @@ const Actions = styled.div`
   `}
 `;
 
+const MetadataBlock = styled.div`
+  ${({ theme }) => css`
+    display: flex;
+    flex-direction: column;
+    gap: ${theme.sizeUnit}px;
+    padding: ${theme.sizeUnit * 2}px;
+    border: 1px solid ${theme.colorBorderSecondary};
+    border-radius: ${theme.borderRadius}px;
+    background: ${theme.colorBgContainer};
+  `}
+`;
+
 const TableList = styled.div`
   ${({ theme }) => css`
     display: flex;
@@ -89,10 +102,16 @@ const TableList = styled.div`
 const TableOption = styled.label`
   ${({ theme }) => css`
     display: flex;
-    align-items: flex-start;
-    gap: ${theme.sizeUnit * 2}px;
+    flex-direction: column;
+    gap: ${theme.sizeUnit / 2}px;
     font-size: ${theme.fontSizeSM}px;
     cursor: pointer;
+
+    .option-line {
+      display: flex;
+      align-items: flex-start;
+      gap: ${theme.sizeUnit * 2}px;
+    }
 
     input {
       flex: 0 0 auto;
@@ -105,6 +124,15 @@ const TableOptionMeta = styled.span`
   ${({ theme }) => css`
     color: ${theme.colorTextSecondary};
     margin-left: ${theme.sizeUnit}px;
+  `}
+`;
+
+const TableOptionDetail = styled.div`
+  ${({ theme }) => css`
+    margin-left: ${theme.sizeUnit * 4}px;
+    color: ${theme.colorTextSecondary};
+    font-size: ${theme.fontSizeSM}px;
+    overflow-wrap: anywhere;
   `}
 `;
 
@@ -137,14 +165,20 @@ export type AiSqlAssistantPanelProps = {
   question: string;
   loading: boolean;
   suggestingTables: boolean;
+  refreshing: boolean;
   error: string | null;
   result: AiSqlAssistantResult | null;
   suggestedTables: AiSqlSuggestedTable[];
   selectedTables: string[];
+  metadataStatus: MetadataStatus | null;
+  feedbackSent: boolean;
   onQuestionChange: (question: string) => void;
   onSuggestTables: () => void;
   onToggleTable: (tableName: string) => void;
   onGenerate: () => void;
+  onRefreshMetadata: () => void;
+  onAcceptResult: () => void;
+  onRejectResult: () => void;
   onCopy: () => void;
   onInsert: () => void;
 };
@@ -155,19 +189,28 @@ const formatContext = (context: AiSqlAssistantContext) =>
     context.schema ? `${t('schema')}: ${context.schema}` : t('default schema'),
   ].join(' / ');
 
+const formatTimestamp = (value?: string) =>
+  value ? new Date(value).toLocaleString() : '';
+
 const AiSqlAssistantPanel = ({
   context,
   question,
   loading,
   suggestingTables,
+  refreshing,
   error,
   result,
   suggestedTables,
   selectedTables,
+  metadataStatus,
+  feedbackSent,
   onQuestionChange,
   onSuggestTables,
   onToggleTable,
   onGenerate,
+  onRefreshMetadata,
+  onAcceptResult,
+  onRejectResult,
   onCopy,
   onInsert,
 }: AiSqlAssistantPanelProps) => (
@@ -176,6 +219,32 @@ const AiSqlAssistantPanel = ({
       <Title>{t('AutoSQL AI Assistant')}</Title>
       <ContextText>{formatContext(context)}</ContextText>
     </Header>
+
+    <MetadataBlock>
+      <ContextText>
+        {metadataStatus
+          ? metadataStatus.synced
+            ? t('Metadata synced')
+            : t('Metadata not synced')
+          : t('Metadata not checked yet')}
+        {metadataStatus?.updatedAt
+          ? ` · ${formatTimestamp(metadataStatus.updatedAt)}`
+          : ''}
+      </ContextText>
+      {metadataStatus && (
+        <ContextText>
+          {t('indexed tables')}: {metadataStatus.indexedTableCount ?? 0}
+          {metadataStatus.columnsUpserted !== undefined
+            ? ` · ${t('columns')}: ${metadataStatus.columnsUpserted}`
+            : ''}
+        </ContextText>
+      )}
+      <Actions>
+        <Button disabled={refreshing} onClick={onRefreshMetadata} block>
+          {refreshing ? t('Refreshing...') : t('Refresh metadata')}
+        </Button>
+      </Actions>
+    </MetadataBlock>
 
     <Input.TextArea
       value={question}
@@ -213,18 +282,29 @@ const AiSqlAssistantPanel = ({
         <TableList>
           {suggestedTables.map(table => (
             <TableOption key={table.name}>
-              <input
-                type="checkbox"
-                checked={selectedTables.includes(table.name)}
-                onChange={() => onToggleTable(table.name)}
-              />
-              <span>
-                {table.name}
-                <TableOptionMeta>
-                  {table.type ? `${table.type} / ` : ''}
-                  {t('score')}: {table.score}
-                </TableOptionMeta>
-              </span>
+              <div className="option-line">
+                <input
+                  type="checkbox"
+                  checked={selectedTables.includes(table.name)}
+                  onChange={() => onToggleTable(table.name)}
+                />
+                <span>
+                  {table.name}
+                  <TableOptionMeta>
+                    {table.type ? `${table.type} / ` : ''}
+                    {t('score')}: {table.score}
+                  </TableOptionMeta>
+                </span>
+              </div>
+              {table.reason && (
+                <TableOptionDetail>{table.reason}</TableOptionDetail>
+              )}
+              {table.matched_columns && table.matched_columns.length > 0 && (
+                <TableOptionDetail>
+                  {t('matched columns')}:{' '}
+                  {table.matched_columns.map(column => column.name).join(', ')}
+                </TableOptionDetail>
+              )}
             </TableOption>
           ))}
         </TableList>
@@ -235,6 +315,44 @@ const AiSqlAssistantPanel = ({
 
     {result && (
       <ResultSection>
+        <ContextText>
+          {result.provider ? `${t('provider')}: ${result.provider}` : ''}
+          {result.model ? ` · ${t('model')}: ${result.model}` : ''}
+          {result.readonly !== undefined
+            ? ` · ${t('readonly')}: ${result.readonly ? t('yes') : t('no')}`
+            : ''}
+        </ContextText>
+
+        {result.provider === 'catalog' &&
+          result.retrieval?.candidates &&
+          result.retrieval.candidates.length > 0 && (
+            <ResultSection>
+              <ContextText>{t('Field attribution result')}</ContextText>
+              <TableList>
+                {result.retrieval.candidates.map(candidate => (
+                  <div key={candidate.table}>
+                    <ContextText>
+                      <strong>{candidate.table}</strong>
+                      {candidate.score !== undefined
+                        ? ` · ${t('score')}: ${candidate.score}`
+                        : ''}
+                    </ContextText>
+                    {candidate.reason && (
+                      <TableOptionDetail>{candidate.reason}</TableOptionDetail>
+                    )}
+                    {candidate.matched_columns &&
+                    candidate.matched_columns.length > 0 ? (
+                      <TableOptionDetail>
+                        {t('matched columns')}:{' '}
+                        {candidate.matched_columns.join(', ')}
+                      </TableOptionDetail>
+                    ) : null}
+                  </div>
+                ))}
+              </TableList>
+            </ResultSection>
+          )}
+
         <SqlBlock>{result.sql}</SqlBlock>
 
         {result.tables.length > 0 && (
@@ -244,11 +362,7 @@ const AiSqlAssistantPanel = ({
         )}
 
         {result.explanation && (
-          <Alert
-            type="info"
-            message={result.explanation}
-            closable={false}
-          />
+          <Alert type="info" message={result.explanation} closable={false} />
         )}
 
         {result.warnings?.map(warning => (
@@ -261,6 +375,12 @@ const AiSqlAssistantPanel = ({
         ))}
 
         <Actions>
+          <Button onClick={onAcceptResult} disabled={feedbackSent}>
+            {feedbackSent ? t('Feedback sent') : t('Accept')}
+          </Button>
+          <Button onClick={onRejectResult} disabled={feedbackSent}>
+            {t('Reject')}
+          </Button>
           <Button onClick={onCopy}>{t('Copy')}</Button>
           <Button buttonStyle="primary" onClick={onInsert}>
             {t('Insert')}

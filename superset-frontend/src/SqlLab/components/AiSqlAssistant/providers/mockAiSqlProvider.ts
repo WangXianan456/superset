@@ -16,7 +16,7 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-import type { AiSqlProvider } from '../types';
+import type { AiSqlProvider, MetadataStatus } from '../types';
 
 const delay = (ms: number) =>
   new Promise(resolve => {
@@ -43,6 +43,8 @@ export const mockAiSqlProvider: AiSqlProvider = {
       explanation:
         'This is a placeholder response for validating the SQL Lab assistant panel.',
       warnings: ['Mock mode only. No real AutoSQL service was called.'],
+      provider: 'mock',
+      readonly: true,
     };
   },
 
@@ -56,11 +58,27 @@ export const mockAiSqlProvider: AiSqlProvider = {
           type: 'table',
           score: 1,
           reason: 'Mock suggested table.',
+          matched_columns: [{ name: 'id', type: 'integer' }],
         },
       ],
       scanned_table_count: 1,
       total_table_count: 1,
       warnings: ['Mock mode only. No real table list was loaded.'],
     };
+  },
+
+  async refreshMetadata(): Promise<MetadataStatus> {
+    await delay(200);
+    return {
+      synced: true,
+      tableCount: 2,
+      indexedTableCount: 2,
+      columnsUpserted: 5,
+      warnings: ['Mock mode only.'],
+    };
+  },
+
+  async sendFeedback(): Promise<void> {
+    await delay(100);
   },
 };

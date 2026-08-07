@@ -85,7 +85,7 @@ def normalize_ai_sql_config() -> dict[str, Any]:
             "llm": {
                 "provider": "deepseek",
                 "base_url": "https://api.deepseek.com",
-                "api_key_env": "sk-959733f3efd24b2084a2a9037b87011e",
+                "api_key_env": "sk-xxxx",
                 "model": "deepseek-v4-flash",
             },
         }

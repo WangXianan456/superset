@@ -355,6 +355,12 @@ const AiSqlAssistantPanel = ({
 
         <SqlBlock>{result.sql}</SqlBlock>
 
+        <ContextText>
+          {t(
+            'Empty result? Check data time range or filters in the warnings, or try without the time condition.',
+          )}
+        </ContextText>
+
         {result.tables.length > 0 && (
           <ContextText>
             {t('Tables')}: {result.tables.join(', ')}

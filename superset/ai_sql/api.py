@@ -816,6 +816,67 @@ def _supersql_generate_result(
     }
 
 
+_SQLGLOT_DIALECTS = {
+    "postgresql": "postgres",
+    "postgres": "postgres",
+    "mysql": "mysql",
+    "mariadb": "mysql",
+    "sqlite": "sqlite",
+    "clickhouse": "clickhouse",
+    "trino": "trino",
+    "presto": "presto",
+    "snowflake": "snowflake",
+    "bigquery": "bigquery",
+    "hive": "hive",
+    "spark": "spark",
+}
+
+
+def _unauthorized_tables(
+    database: Any,
+    catalog: str | None,
+    schema: str | None,
+    sql: str,
+) -> list[str]:
+    """Return generated SQL tables the current user cannot access."""
+    if not sql:
+        return []
+    dialect = getattr(database, "backend", None) or database.db_engine_spec.engine
+    read_dialect = _SQLGLOT_DIALECTS.get(str(dialect).lower(), "postgres")
+    try:
+        from sqlglot import exp, parse
+    except ImportError:
+        return []
+
+    try:
+        statements = parse(sql, read=read_dialect)
+    except Exception:
+        logger.exception("Unable to parse generated SQL for table check.")
+        return []
+
+    unauthorized: list[str] = []
+    seen: set[tuple[str, str | None]] = set()
+    for statement in statements:
+        for table in statement.find_all(exp.Table):
+            table_name = str(table.name or "")
+            table_db = str(table.db or "")
+            key = (table_name, schema)
+            if not table_name or key in seen:
+                continue
+            seen.add(key)
+            if table_db and table_db.lower() != (schema or "").lower():
+                unauthorized.append(f"{table_db}.{table_name}")
+                continue
+            try:
+                security_manager.raise_for_access(
+                    database=database,
+                    table=Table(table_name, schema, catalog),
+                )
+            except SupersetSecurityException:
+                unauthorized.append(table_name)
+    return sorted(set(unauthorized))
+
+
 class AiSqlRestApi(BaseSupersetApi):
     method_permission_name = {
         "generate": "read",
@@ -1344,6 +1405,19 @@ class AiSqlRestApi(BaseSupersetApi):
                     allowed_columns={},
                     current_sql=payload.get("current_sql"),
                 )
+                unauthorized = _unauthorized_tables(
+                    database,
+                    catalog,
+                    schema,
+                    supersql_result.get("sql", ""),
+                )
+                if unauthorized:
+                    return self.response_422(
+                        message=(
+                            "生成 SQL 引用了无权访问或当前 schema 外的表："
+                            + ", ".join(unauthorized)
+                        )
+                    )
                 return self.response(
                     200,
                     result=_supersql_generate_result(
